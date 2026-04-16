@@ -542,7 +542,7 @@
                 return () => { window.removeEventListener('online', handleOnline); window.removeEventListener('offline', handleOffline); };
             }, []);
 
-            const showNotify = (msg) => { setNotification(msg); setTimeout(() => setNotification(null), 3000); };
+            const showNotify = (msg) => { setNotification(msg); setTimeout(() => setNotification(null), 4000); };
 
             const formatDate = (date) => {
                 const d = new Date(date);
@@ -578,47 +578,44 @@
 
             useEffect(() => { const timer = setTimeout(() => setShowSplash(false), 3300); return () => clearTimeout(timer); }, []);
 
-            // NUEVA LÓGICA DE AUTENTICACIÓN Y ROLES (Admin vs Cobrador)
+            // NUEVA LÓGICA DE AUTENTICACIÓN Y ROLES CON MANEJO DE ERRORES (permission-denied fix)
             useEffect(() => {
+                let unsubProfile = null;
                 const unsubscribe = auth.onAuthStateChanged(usr => {
                     setUser(usr);
+                    if (unsubProfile) { unsubProfile(); unsubProfile = null; } // Evita fugas de memoria
+                    
                     if (usr) {
-                        db.collection('users').doc(usr.uid).onSnapshot(doc => {
+                        unsubProfile = db.collection('users').doc(usr.uid).onSnapshot(doc => {
                             if (doc.exists) {
                                 const profile = doc.data();
                                 
-                                // ¡SOLUCIÓN AQUÍ!
-                                // Si el documento existe (por guardar ajustes) pero no tiene rol, 
-                                // forzamos automáticamente a que sea Admin. Los cobradores siempre 
-                                // tienen su rol definido al crearse, así que esto es 100% seguro.
                                 if (!profile.role) {
                                     profile.role = 'admin';
-                                    // Opcional: Escribirlo de vuelta en Firebase para que quede fijo
-                                    db.collection('users').doc(usr.uid).set({ role: 'admin' }, { merge: true });
+                                    db.collection('users').doc(usr.uid).set({ role: 'admin' }, { merge: true }).catch(err => console.error(err));
                                 }
 
-                                // Bloqueo estricto para cobradores eliminados
                                 if (profile.status === 'deleted' || profile.role === 'disabled') {
                                     auth.signOut();
                                     showNotify("Tu acceso ha sido revocado por el administrador.");
                                     return;
                                 }
                                 setUserProfile(profile);
-                                // Si es cobrador, usar el UID del admin para leer clientes. Si no, usar su propio UID.
                                 setAdminUid(profile.role === 'cobrador' ? profile.adminUid : usr.uid);
                                 setView('dashboard');
                             } else {
-                                // Si no tiene documento en la base de datos, es un Admin nuevo
                                 setUserProfile({ role: 'admin' });
                                 setAdminUid(usr.uid);
                                 setView('dashboard');
                             }
+                        }, error => {
+                            console.error("Firestore Permission Error (Profile):", error);
+                            showNotify("Acceso Denegado por Firebase. Verifica que tus Reglas de Seguridad (Rules) no hayan expirado.");
                         });
                     } else {
                         setView('login');
                         setUserProfile(null);
                         setAdminUid(null);
-                        // ¡CLAVE! Limpiar toda la memoria al cerrar sesión
                         setClients([]);
                         setCobradores([]);
                         setStoredGains([]);
@@ -627,37 +624,52 @@
                         setReminderClient(null);
                     }
                 });
-                return () => unsubscribe();
+                return () => {
+                    unsubscribe();
+                    if (unsubProfile) unsubProfile();
+                };
             }, []);
 
-            // Suscripción a los datos (usando adminUid)
+            // Suscripción a los datos (usando adminUid) CON MANEJO DE ERRORES DE REGLAS
             useEffect(() => {
                 if (adminUid) {
                     const unsubClients = db.collection('users').doc(adminUid).collection('clients').onSnapshot(snap => {
                         setClients(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+                    }, error => {
+                        console.error("Firestore Permission Error (Clients):", error);
+                        showNotify("Permisos insuficientes para leer clientes. Revisa la consola de Firebase.");
                     });
-                    const unsubGains = db.collection('users').doc(adminUid).collection('gains').orderBy('date', 'desc').onSnapshot(snap => {
-                        setStoredGains(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+                    
+                    // Retirado orderBy() para prevenir bloqueos por falta de índices. Ordenamiento en memoria.
+                    const unsubGains = db.collection('users').doc(adminUid).collection('gains').onSnapshot(snap => {
+                        const data = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+                        // Ordenamiento manual descendente por fecha/timestamp
+                        data.sort((a, b) => new Date(b.timestamp || 0) - new Date(a.timestamp || 0));
+                        setStoredGains(data);
+                    }, error => {
+                        console.error("Firestore Permission Error (Gains):", error);
+                        showNotify("Permisos insuficientes para leer ganancias. Revisa la consola de Firebase.");
                     });
+                    
                     return () => { unsubClients(); unsubGains(); };
                 } else {
-                    // Limpiar clientes si no hay adminUid
                     setClients([]);
                     setStoredGains([]);
                 }
             }, [adminUid]);
 
-            // Obtener lista de cobradores creados por este admin
+            // Obtener lista de cobradores creados por este admin CON MANEJO DE ERRORES
             useEffect(() => {
                 if (user?.uid && userProfile?.role !== 'cobrador' && userProfile?.role !== 'empleado') {
                     const unsub = db.collection('users').where('adminUid', '==', user.uid).onSnapshot(snap => {
                         const loadedCobradores = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-                        // Ocultamos los que fueron "eliminados" visualmente
                         setCobradores(loadedCobradores.filter(c => c.status !== 'deleted'));
+                    }, error => {
+                        console.error("Firestore Permission Error (Cobradores):", error);
+                        showNotify("Permisos denegados para leer usuarios secundarios.");
                     });
                     return () => unsub();
                 } else {
-                    // Vaciar la lista si cambia de cuenta o entra un cobrador
                     setCobradores([]);
                 }
             }, [user?.uid, userProfile?.role]);
@@ -707,6 +719,8 @@
                         showNotify("Error: La contraseña debe tener al menos 6 caracteres.");
                     } else if (err.code === 'auth/invalid-email') {
                         showNotify("Error: El formato del correo no es válido.");
+                    } else if (err.code === 'permission-denied') {
+                        showNotify("Error Firebase: Permisos de escritura denegados por reglas de seguridad.");
                     } else {
                         showNotify("Error al crear cobrador: " + err.message);
                     }
@@ -831,7 +845,9 @@
 
                     setIsTransacting(false);
                     if(amount > 0) setReceiptData({ client, transaction });
-                } catch (error) { showNotify("Error al procesar el pago"); } finally { setIsProcessing(false); }
+                } catch (error) { 
+                    showNotify("Error al procesar el pago. Verifica permisos de tu DB."); 
+                } finally { setIsProcessing(false); }
             };
 
             const handleDeleteClient = async (id) => {
@@ -1334,22 +1350,22 @@
                                         )}
                                     </div>
                                 </div>
-                                <div className="bg-indigo-600 rounded-[2.5rem] p-7 text-white shadow-2xl shadow-indigo-600/40 relative overflow-hidden">
+                                <div className="bg-indigo-600 rounded-[2.5rem] p-5 sm:p-7 text-white shadow-2xl shadow-indigo-600/40 relative overflow-hidden">
                                     <div className="absolute -right-10 -top-10 w-40 h-40 bg-white/10 rounded-full blur-2xl"></div>
                                     <div className="absolute -left-10 -bottom-10 w-40 h-40 bg-indigo-900/30 rounded-full blur-2xl"></div>
-                                    <div className="relative z-10 flex justify-between items-end">
-                                        <div>
-                                            <p className="text-[10px] font-black uppercase tracking-[0.2em] text-indigo-200 mb-2">Capital en la Calle</p>
-                                            <h1 className="heading-font text-4xl font-black tracking-tighter">{currency}{privacyMode && !isRestrictedRole ? '***,***' : Math.round(netCapitalOnStreet).toLocaleString()}</h1>
-                                            <div className="mt-2 bg-emerald-500/20 px-3 py-1 rounded-lg inline-block border border-emerald-500/30">
-                                                <p className="text-[9px] text-emerald-300 font-black uppercase tracking-widest">G. Pendiente: {currency}{privacyMode && !isRestrictedRole ? '***' : Math.round(pendingProfit).toLocaleString()}</p>
+                                    <div className="relative z-10 flex justify-between items-end gap-2">
+                                        <div className="flex-1 min-w-0">
+                                            <p className="text-[8px] sm:text-[10px] font-black uppercase tracking-widest text-indigo-200 mb-1 sm:mb-2 truncate">Capital en la Calle</p>
+                                            <h1 className="heading-font text-2xl sm:text-3xl md:text-4xl font-black tracking-tighter truncate">{currency}{privacyMode && !isRestrictedRole ? '***,***' : Math.round(netCapitalOnStreet).toLocaleString()}</h1>
+                                            <div className="mt-1 sm:mt-2 bg-emerald-500/20 px-2 sm:px-3 py-1 rounded-lg inline-block border border-emerald-500/30 max-w-full">
+                                                <p className="text-[7px] sm:text-[9px] text-emerald-300 font-black uppercase tracking-widest truncate">G. Pendiente: {currency}{privacyMode && !isRestrictedRole ? '***' : Math.round(pendingProfit).toLocaleString()}</p>
                                             </div>
                                         </div>
-                                        <div className="text-right">
-                                            <p className="text-[10px] font-black uppercase tracking-[0.2em] text-indigo-200 mb-2">Cobrado Hoy</p>
-                                            <h2 className="text-xl font-black text-emerald-400">+{currency}{privacyMode && !isRestrictedRole ? '***' : Math.round(totalCollectedToday).toLocaleString()}</h2>
+                                        <div className="text-right flex-shrink-0">
+                                            <p className="text-[8px] sm:text-[10px] font-black uppercase tracking-widest text-indigo-200 mb-1 sm:mb-2">Cobrado Hoy</p>
+                                            <h2 className="text-lg sm:text-xl font-black text-emerald-400">+{currency}{privacyMode && !isRestrictedRole ? '***' : Math.round(totalCollectedToday).toLocaleString()}</h2>
                                             {(userProfile?.historicalGains > 0 && !isRestrictedRole) && (
-                                                <p className="text-[8px] text-indigo-400 font-bold uppercase mt-1">Histórico: {currency}{privacyMode ? '***' : Math.round(userProfile.historicalGains).toLocaleString()}</p>
+                                                <p className="text-[7px] sm:text-[8px] text-indigo-400 font-bold uppercase mt-1">Histórico: {currency}{privacyMode ? '***' : Math.round(userProfile.historicalGains).toLocaleString()}</p>
                                             )}
                                         </div>
                                     </div>
